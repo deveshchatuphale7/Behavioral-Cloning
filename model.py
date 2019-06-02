@@ -1,204 +1,75 @@
-import os
+
+import csv
 import cv2
-from keras.layers import Input, Lambda
-from keras.models import Model
-import tensorflow as tf
+import numpy as np
+import keras
+from keras.models import Sequential
+from keras.layers import Dense, Flatten, Lambda, Conv2D, MaxPooling2D, Cropping2D, Dropout, LeakyReLU
+from keras import backend as K
+from sklearn.model_selection import train_test_split
+from sklearn.utils import shuffle
+from keras import optimizers
 
-def load_image(log_path, filename):
-    filename = filename.strip()
-    if filename.startswith('IMG'):
-        filename = log_path+'/'+filename
-    else:
-        # load it relative to where log file is now, not whats in it
-        filename = log_path+'/IMG/'+PurePosixPath(filename).name
-    img = cv2.imread(filename)
-    # return cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+lines = []
+with open('../sim_data/driving_log.csv') as f:
+	reader = csv.reader(f)
+	for line in reader:
+		lines.append(line)
 
+train_samples, validation_samples = train_test_split(lines, test_size=0.2)
 
-# randomily change the image brightness
-def randomise_image_brightness(image):
-    hsv = cv2.cvtColor(image, cv2.COLOR_RGB2HSV)
-    # brightness - referenced Vivek Yadav post
-    # https://chatbotslife.com/using-augmentation-to-mimic-human-driving-496b569760a9#.yh93soib0
+correction = 0.2
+def generator(samples, batch_size=32):
+    num_samples = len(samples)
+    while 1:
+        shuffle(samples)
+        for offset in range(0, num_samples, batch_size):
+            batch_samples = samples[offset:offset+batch_size]
 
-    bv = .25 + np.random.uniform()
-    hsv[::2] = hsv[::2]*bv
+            images = []
+            angles = []
+            for batch_sample in batch_samples:
+            	for i in range(3):
+            		path = '../sim_data/IMG/' + batch_sample[i].split('/')[-1]
+            		image = cv2.cvtColor(cv2.imread(path), cv2.COLOR_BGR2HSV)
+            		tmp = image[:,:,1].reshape(160, 320, 1)
+            		images.append(tmp)
+            		tmp2 = cv2.flip(tmp,1).reshape(160, 320, 1)
+            		images.append(tmp2)
 
-    return cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+            	angle = float(batch_sample[3])
+            	temp = [angle, -1.*angle, angle+correction, -1.*(angle+correction), angle-correction, -1.*(angle-correction)]
+            	angles.extend(temp)
 
+            X_train = np.array(images)
+            y_train = np.array(angles)
+            yield shuffle(X_train, y_train)
 
-# crop camera image to fit nvidia model input shape
-def crop_camera(img, crop_height=66, crop_width=200):
-    height = img.shape[0]
-    width = img.shape[1]
+train_generator = generator(train_samples)
+validation_generator = generator(validation_samples)
 
-    # y_start = 60+random.randint(-10, 10)
-    # x_start = int(width/2)-int(crop_width/2)+random.randint(-40, 40)
-    y_start = 60
-    x_start = int(width/2)-int(crop_width/2)
-
-    return img[y_start:y_start+crop_height, x_start:x_start+crop_width]
-
-
-# referenced Vivek Yadav post
-# https://chatbotslife.com/using-augmentation-to-mimic-human-driving-496b569760a9#.yh93soib0
-def jitter_image_rotation(image, steering):
-    rows, cols, _ = image.shape
-    transRange = 100
-    numPixels = 10
-    valPixels = 0.4
-    transX = transRange * np.random.uniform() - transRange/2
-    steering = steering + transX/transRange * 2 * valPixels
-    transY = numPixels * np.random.uniform() - numPixels/2
-    transMat = np.float32([[1, 0, transX], [0, 1, transY]])
-    image = cv2.warpAffine(image, transMat, (cols, rows))
-    return image, steering
-
-
-# if driving in a straight line remove extra rows
-def filter_driving_straight(data_df, hist_items=5):
-    print('filtering straight line driving with %d frames consective' %
-          hist_items)
-    steering_history = deque([])
-    drop_rows = []
-
-    for idx, row in data_df.iterrows():
-        # controls = [getattr(row, control) for control in vehicle_controls]
-        steering = getattr(row, 'steering')
-
-        # record the recent steering history
-        steering_history.append(steering)
-        if len(steering_history) > hist_items:
-            steering_history.popleft()
-
-        # if just driving in a straight
-        if steering_history.count(0.0) == hist_items:
-            drop_rows.append(idx)
-
-    # return the dataframe minus straight lines that met criteria
-    return data_df.drop(data_df.index[drop_rows])
-
-
-# jitter random camera image, adjust steering and randomise brightness
-def jitter_camera_image(row, log_path, cameras):
-    steering = getattr(row, 'steering')
-
-    # use one of the cameras randomily
-    camera = cameras[random.randint(0, len(cameras)-1)]
-    steering += steering_adj[camera]
-
-    image = load_image(log_path, getattr(row, camera))
-    image, steering = jitter_image_rotation(image, steering)
-    image = randomise_image_brightness(image)
-
-    return image, steering
-
-
-# create a training data generator for keras fit_model
-def gen_train_data(log_path='./data', log_file='driving_log.csv', skiprows=1,
-                   cameras=cameras, filter_straights=False,
-                   crop_image=True, batch_size=128):
-
-    # load the csv log file
-    print("Cameras: ", cameras)
-    print("Log path: ", log_path)
-    print("Log file: ", log_file)
-
-    column_names = ['center', 'left', 'right',
-                    'steering', 'throttle', 'brake', 'speed']
-    data_df = pd.read_csv(log_path+'/'+log_file,
-                          names=column_names, skiprows=skiprows)
-
-    # filter out straight line stretches
-    if filter_straights:
-        data_df = filter_driving_straight(data_df)
-
-    data_count = len(data_df)
-
-    print("Log with %d rows." % (len(data_df)))
-
-    while True:  # need to keep generating data
-
-        # initialise data extract
-        features = []
-        labels = []
-
-        # create a random batch to return
-        while len(features) < batch_size:
-            row = data_df.iloc[np.random.randint(data_count-1)]
-
-            image, steering = jitter_camera_image(row, log_path, cameras)
-
-            # flip 50% randomily that are not driving straight
-            if random.random() >= .5 and abs(steering) > 0.1:
-                image = cv2.flip(image, 1)
-                steering = -steering
-
-            if crop_image:
-                image = crop_camera(image)
-
-            features.append(image)
-            labels.append(steering)
-
-        # yield the batch
-        yield (np.array(features), np.array(labels))
-
-
-# create a valdiation data generator for keras fit_model
-def gen_val_data(log_path='/u200/Udacity/behavioral-cloning-project/data',
-                 log_file='driving_log.csv', camera=camera_centre[0],
-                 crop_image=True, skiprows=1,
-                 batch_size=128):
-
-    # load the csv log file
-    print("Camera: ", camera)
-    print("Log path: ", log_path)
-    print("Log file: ", log_file)
-
-    column_names = ['center', 'left', 'right',
-                    'steering', 'throttle', 'brake', 'speed']
-    data_df = pd.read_csv(log_path+'/'+log_file,
-                          names=column_names, skiprows=skiprows)
-    data_count = len(data_df)
-    print("Log with %d rows."
-          % (data_count))
-
-    while True:  # need to keep generating data
-
-        # initialise data extract
-        features = []
-        labels = []
-
-        # create a random batch to return
-        while len(features) < batch_size:
-            row = data_df.iloc[np.random.randint(data_count-1)]
-            steering = getattr(row, 'steering')
-
-            # adjust steering if not center
-            steering += steering_adj[camera]
-
-            image = load_image(log_path, getattr(row, camera))
-
-            if crop_image:
-                image = crop_camera(image)
-
-            features.append(image)
-            labels.append(steering)
-
-        # yield the batch
-        yield (np.array(features), np.array(labels))
-
-
-
-        # Build the Final Test Neural Network in Keras Here
 model = Sequential()
-model.add(Conv2D(32, (3, 3), input_shape=(32, 32, 3)))
-model.add(MaxPooling2D((2, 2)))
-model.add(Dropout(0.5))
-model.add(Activation('relu'))
+model.add(Lambda(lambda x: x/255.0 - 0.5, input_shape=(160, 320, 1)))
+model.add(Cropping2D(cropping=((50, 20), (0, 0))))
+model.add(Lambda(lambda image:K.tf.image.resize_images(image, size=(128, 128))))
+
+model.add(Conv2D(16, (8, 8), strides=(4, 4), padding="same"))
+model.add(LeakyReLU())
+model.add(Conv2D(24, (5, 5), strides=(3, 3), padding="same"))
+model.add(LeakyReLU())
+model.add(Conv2D(36, (5, 5), strides=(3, 3), padding="same"))
+model.add(LeakyReLU())
+model.add(Conv2D(48, (5, 5), strides=(3, 3), padding="same"))
+model.add(LeakyReLU())
+model.add(Conv2D(64, (3, 3), strides=(2, 2), padding="same"))
 model.add(Flatten())
-model.add(Dense(128))
-model.add(Activation('relu'))
-model.add(Dense(5))
-model.add(Activation('softmax'))
+model.add(Dropout(.2))
+model.add(LeakyReLU())
+model.add(Dense(512))
+model.add(Dropout(.5))
+model.add(LeakyReLU())
+model.add(Dense(1))
+
+model.compile(optimizer='Adam', loss='mse')
+model.fit_generator(train_generator, steps_per_epoch= len(train_samples), validation_data=validation_generator, validation_steps=len(validation_samples), epochs=5, verbose = 1)
+model.save('model.h5')
